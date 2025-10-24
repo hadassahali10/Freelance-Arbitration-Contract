@@ -8,6 +8,9 @@
 (define-constant ERR_ALREADY_VOTED (err u105))
 (define-constant ERR_NOT_ARBITRATOR (err u106))
 (define-constant ERR_INVALID_AMOUNT (err u107))
+(define-constant ERR_MILESTONE_NOT_FOUND (err u108))
+(define-constant ERR_MILESTONE_ALREADY_RELEASED (err u109))
+(define-constant ERR_INVALID_MILESTONE_COUNT (err u110))
 
 (define-constant STATUS_ACTIVE u0)
 (define-constant STATUS_COMPLETED u1)
@@ -21,6 +24,7 @@
 (define-data-var next-contract-id uint u1)
 (define-data-var dao-enabled bool false)
 (define-data-var arbitration-fee uint u10)
+(define-data-var next-milestone-id uint u1)
 
 (define-map contracts
   { contract-id: uint }
@@ -51,6 +55,22 @@
   { votes-for-freelancer: uint, votes-for-client: uint, total-votes: uint }
 )
 
+(define-map milestones
+  { milestone-id: uint }
+  {
+    contract-id: uint,
+    amount: uint,
+    description: (string-ascii 256),
+    released: bool,
+    sequence: uint
+  }
+)
+
+(define-map contract-milestones
+  { contract-id: uint }
+  { milestone-count: uint, total-released: uint, has-milestones: bool }
+)
+
 (define-public (create-contract (freelancer principal) (amount uint) (arbitrator (optional principal)) (description (string-ascii 256)))
   (let (
     (contract-id (var-get next-contract-id))
@@ -72,8 +92,114 @@
         description: description
       }
     )
+    (map-set contract-milestones
+      { contract-id: contract-id }
+      { milestone-count: u0, total-released: u0, has-milestones: false }
+    )
     (var-set next-contract-id (+ contract-id u1))
     (ok contract-id)
+  )
+)
+
+(define-public (create-contract-with-milestones 
+  (freelancer principal) 
+  (arbitrator (optional principal)) 
+  (description (string-ascii 256))
+  (milestone-amounts (list 10 uint))
+  (milestone-descriptions (list 10 (string-ascii 256))))
+  (let (
+    (contract-id (var-get next-contract-id))
+    (current-block stacks-block-height)
+    (total-amount (fold + milestone-amounts u0))
+    (milestone-count (len milestone-amounts))
+  )
+    (asserts! (> milestone-count u0) ERR_INVALID_MILESTONE_COUNT)
+    (asserts! (is-eq milestone-count (len milestone-descriptions)) ERR_INVALID_MILESTONE_COUNT)
+    (asserts! (> total-amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (is-none (map-get? contracts { contract-id: contract-id })) ERR_CONTRACT_NOT_FOUND)
+    (try! (stx-transfer? total-amount tx-sender (as-contract tx-sender)))
+    (map-set contracts
+      { contract-id: contract-id }
+      {
+        client: tx-sender,
+        freelancer: freelancer,
+        amount: total-amount,
+        arbitrator: arbitrator,
+        status: STATUS_ACTIVE,
+        created-at: current-block,
+        dispute-deadline: none,
+        description: description
+      }
+    )
+    (map-set contract-milestones
+      { contract-id: contract-id }
+      { milestone-count: milestone-count, total-released: u0, has-milestones: true }
+    )
+    (let (
+      (result (fold create-milestone-entry
+        (zip milestone-amounts milestone-descriptions)
+        { contract-id: contract-id, sequence: u0, success: true }))
+    )
+      (asserts! (get success result) ERR_INVALID_AMOUNT)
+      (var-set next-contract-id (+ contract-id u1))
+      (ok contract-id)
+    )
+  )
+)
+
+(define-private (create-milestone-entry 
+  (data { amount: uint, description: (string-ascii 256) })
+  (state { contract-id: uint, sequence: uint, success: bool }))
+  (let (
+    (milestone-id (var-get next-milestone-id))
+  )
+    (if (get success state)
+      (begin
+        (map-set milestones
+          { milestone-id: milestone-id }
+          {
+            contract-id: (get contract-id state),
+            amount: (get amount data),
+            description: (get description data),
+            released: false,
+            sequence: (get sequence state)
+          }
+        )
+        (var-set next-milestone-id (+ milestone-id u1))
+        { contract-id: (get contract-id state), sequence: (+ (get sequence state) u1), success: true }
+      )
+      state
+    )
+  )
+)
+
+(define-private (zip (amounts (list 10 uint)) (descriptions (list 10 (string-ascii 256))))
+  (map pair-items amounts descriptions)
+)
+
+(define-private (pair-items (amount uint) (description (string-ascii 256)))
+  { amount: amount, description: description }
+)
+
+(define-public (release-milestone (milestone-id uint))
+  (let (
+    (milestone-data (unwrap! (map-get? milestones { milestone-id: milestone-id }) ERR_MILESTONE_NOT_FOUND))
+    (contract-data (unwrap! (map-get? contracts { contract-id: (get contract-id milestone-data) }) ERR_CONTRACT_NOT_FOUND))
+    (contract-milestone-info (unwrap! (map-get? contract-milestones { contract-id: (get contract-id milestone-data) }) ERR_CONTRACT_NOT_FOUND))
+  )
+    (asserts! (is-eq tx-sender (get client contract-data)) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq (get status contract-data) STATUS_ACTIVE) ERR_INVALID_STATUS)
+    (asserts! (not (get released milestone-data)) ERR_MILESTONE_ALREADY_RELEASED)
+    (try! (as-contract (stx-transfer? (get amount milestone-data) tx-sender (get freelancer contract-data))))
+    (map-set milestones
+      { milestone-id: milestone-id }
+      (merge milestone-data { released: true })
+    )
+    (map-set contract-milestones
+      { contract-id: (get contract-id milestone-data) }
+      (merge contract-milestone-info { total-released: (+ (get total-released contract-milestone-info) u1) })
+    )
+    (ok true)
   )
 )
 
@@ -278,4 +404,12 @@
 
 (define-read-only (get-next-contract-id)
   (var-get next-contract-id)
+)
+
+(define-read-only (get-milestone (milestone-id uint))
+  (map-get? milestones { milestone-id: milestone-id })
+)
+
+(define-read-only (get-contract-milestone-info (contract-id uint))
+  (map-get? contract-milestones { contract-id: contract-id })
 )
