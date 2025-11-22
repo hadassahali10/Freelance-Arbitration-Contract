@@ -11,6 +11,10 @@
 (define-constant ERR_MILESTONE_NOT_FOUND (err u108))
 (define-constant ERR_MILESTONE_ALREADY_RELEASED (err u109))
 (define-constant ERR_INVALID_MILESTONE_COUNT (err u110))
+(define-constant ERR_AMENDMENT_NOT_FOUND (err u111))
+(define-constant ERR_AMENDMENT_ALREADY_EXISTS (err u112))
+(define-constant ERR_INSUFFICIENT_PAYMENT (err u113))
+(define-constant ERR_AMENDMENT_EXPIRED (err u114))
 
 (define-constant STATUS_ACTIVE u0)
 (define-constant STATUS_COMPLETED u1)
@@ -25,6 +29,27 @@
 (define-data-var dao-enabled bool false)
 (define-data-var arbitration-fee uint u10)
 (define-data-var next-milestone-id uint u1)
+(define-data-var next-amendment-id uint u1)
+(define-data-var amendment-validity-period uint u1440)
+
+(define-map amendments
+  { amendment-id: uint }
+  {
+    contract-id: uint,
+    proposer: principal,
+    new-amount: uint,
+    amount-change: int,
+    new-description: (string-ascii 256),
+    created-at: uint,
+    expires-at: uint,
+    accepted: bool
+  }
+)
+
+(define-map pending-amendments
+  { contract-id: uint }
+  { amendment-id: uint }
+)
 
 (define-map contracts
   { contract-id: uint }
@@ -412,4 +437,125 @@
 
 (define-read-only (get-contract-milestone-info (contract-id uint))
   (map-get? contract-milestones { contract-id: contract-id })
+)
+
+(define-public (propose-amendment (contract-id uint) (new-amount uint) (new-description (string-ascii 256)))
+  (let (
+    (contract-data (unwrap! (map-get? contracts { contract-id: contract-id }) ERR_CONTRACT_NOT_FOUND))
+    (current-block stacks-block-height)
+    (amendment-id (var-get next-amendment-id))
+    (current-amount (get amount contract-data))
+    (amount-diff (if (>= new-amount current-amount) 
+                     (to-int (- new-amount current-amount))
+                     (- (to-int (- current-amount new-amount)))))
+  )
+    (asserts! (is-eq (get status contract-data) STATUS_ACTIVE) ERR_INVALID_STATUS)
+    (asserts! (or (is-eq tx-sender (get client contract-data)) 
+                  (is-eq tx-sender (get freelancer contract-data))) ERR_NOT_AUTHORIZED)
+    (asserts! (is-none (map-get? pending-amendments { contract-id: contract-id })) ERR_AMENDMENT_ALREADY_EXISTS)
+    (asserts! (> new-amount u0) ERR_INVALID_AMOUNT)
+    (if (> new-amount current-amount)
+        (begin
+          (asserts! (is-eq tx-sender (get client contract-data)) ERR_NOT_AUTHORIZED)
+          (try! (stx-transfer? (- new-amount current-amount) tx-sender (as-contract tx-sender)))
+        )
+        true
+    )
+    (map-set amendments
+      { amendment-id: amendment-id }
+      {
+        contract-id: contract-id,
+        proposer: tx-sender,
+        new-amount: new-amount,
+        amount-change: amount-diff,
+        new-description: new-description,
+        created-at: current-block,
+        expires-at: (+ current-block (var-get amendment-validity-period)),
+        accepted: false
+      }
+    )
+    (map-set pending-amendments
+      { contract-id: contract-id }
+      { amendment-id: amendment-id }
+    )
+    (var-set next-amendment-id (+ amendment-id u1))
+    (ok amendment-id)
+  )
+)
+
+(define-public (accept-amendment (amendment-id uint))
+  (let (
+    (amendment-data (unwrap! (map-get? amendments { amendment-id: amendment-id }) ERR_AMENDMENT_NOT_FOUND))
+    (contract-data (unwrap! (map-get? contracts { contract-id: (get contract-id amendment-data) }) ERR_CONTRACT_NOT_FOUND))
+    (current-block stacks-block-height)
+  )
+    (asserts! (< current-block (get expires-at amendment-data)) ERR_AMENDMENT_EXPIRED)
+    (asserts! (not (get accepted amendment-data)) ERR_INVALID_STATUS)
+    (asserts! (is-eq (get status contract-data) STATUS_ACTIVE) ERR_INVALID_STATUS)
+    (asserts! (or 
+                (and (is-eq (get proposer amendment-data) (get client contract-data)) 
+                     (is-eq tx-sender (get freelancer contract-data)))
+                (and (is-eq (get proposer amendment-data) (get freelancer contract-data)) 
+                     (is-eq tx-sender (get client contract-data)))) ERR_NOT_AUTHORIZED)
+    (let (
+      (current-amount (get amount contract-data))
+      (new-amount (get new-amount amendment-data))
+    )
+      (if (< new-amount current-amount)
+          (try! (as-contract (stx-transfer? (- current-amount new-amount) tx-sender (get client contract-data))))
+          true
+      )
+      (map-set contracts
+        { contract-id: (get contract-id amendment-data) }
+        (merge contract-data {
+          amount: new-amount,
+          description: (get new-description amendment-data)
+        })
+      )
+      (map-set amendments
+        { amendment-id: amendment-id }
+        (merge amendment-data { accepted: true })
+      )
+      (map-delete pending-amendments { contract-id: (get contract-id amendment-data) })
+      (ok true)
+    )
+  )
+)
+
+(define-public (reject-amendment (amendment-id uint))
+  (let (
+    (amendment-data (unwrap! (map-get? amendments { amendment-id: amendment-id }) ERR_AMENDMENT_NOT_FOUND))
+    (contract-data (unwrap! (map-get? contracts { contract-id: (get contract-id amendment-data) }) ERR_CONTRACT_NOT_FOUND))
+  )
+    (asserts! (not (get accepted amendment-data)) ERR_INVALID_STATUS)
+    (asserts! (or 
+                (and (is-eq (get proposer amendment-data) (get client contract-data)) 
+                     (is-eq tx-sender (get freelancer contract-data)))
+                (and (is-eq (get proposer amendment-data) (get freelancer contract-data)) 
+                     (is-eq tx-sender (get client contract-data)))) ERR_NOT_AUTHORIZED)
+    (let (
+      (current-amount (get amount contract-data))
+      (new-amount (get new-amount amendment-data))
+    )
+      (if (> new-amount current-amount)
+          (try! (as-contract (stx-transfer? (- new-amount current-amount) tx-sender (get proposer amendment-data))))
+          true
+      )
+      (map-delete amendments { amendment-id: amendment-id })
+      (map-delete pending-amendments { contract-id: (get contract-id amendment-data) })
+      (ok true)
+    )
+  )
+)
+
+(define-read-only (get-amendment (amendment-id uint))
+  (map-get? amendments { amendment-id: amendment-id })
+)
+
+(define-read-only (get-pending-amendment (contract-id uint))
+  (map-get? pending-amendments { contract-id: contract-id })
+)
+
+(define-read-only (get-amendment-validity-period)
+  (var-get amendment-validity-period)
 )
